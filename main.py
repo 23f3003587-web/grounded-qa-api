@@ -34,40 +34,36 @@ def find_grounded_answer(question: str, chunks: List[Chunk]):
 
     q_lower = question.lower().strip()
 
-    # Find the best matching chunk(s)
+    # Find best matching chunk
     best_chunk = None
-    highest_score = 0
+    best_score = 0.0
 
     for chunk in chunks:
         c_lower = chunk.text.lower()
-        # Score calculation
-        score = 0
-        if q_lower in c_lower:
-            score = 1.0
-        else:
-            q_words = set(q_lower.split())
-            c_words = set(c_lower.split())
-            common = len(q_words & c_words)
-            score = common / len(q_words) if q_words else 0
+        # Strong matching
+        if q_lower in c_lower or any(word in c_lower for word in q_lower.split() if len(word) > 2):
+            score = 1.0 if q_lower in c_lower else 0.8
+            if score > best_score:
+                best_score = score
+                best_chunk = chunk
 
-        if score > highest_score:
-            highest_score = score
-            best_chunk = chunk
-
-    if best_chunk and highest_score > 0.25:
+    if best_chunk:
+        # Use the exact chunk text as answer
         answer = best_chunk.text.strip()
-        # Keep answer reasonable length
-        if len(answer) > 280:
+
+        # Optional: make it a bit shorter
+        if len(answer) > 250:
             sentences = re.split(r'(?<=[.!?])\s+', answer)
-            answer = ' '.join(sentences[:2]).strip()
+            answer = ' '.join(sentences[:2]).strip() + '.'
 
         return Response(
             answer=answer,
-            citations=[best_chunk.chunk_id],   # Strict - only real chunk_id
-            confidence=0.92,
+            citations=[best_chunk.chunk_id],   # Exact chunk_id
+            confidence=0.95,
             answerable=True
         )
 
+    # Not answerable
     return Response(
         answer="I don't know",
         citations=[],
@@ -85,7 +81,7 @@ async def grounded_qa(req: Request):
 @app.get("/grounded-qa")
 @app.get("/")
 async def grounded_qa_get():
-    return {"status": "ok", "message": "POST required"}
+    return {"status": "ok", "message": "Use POST"}
 
 
 @app.get("/health")

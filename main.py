@@ -4,7 +4,6 @@ from pydantic import BaseModel
 from typing import List
 import os
 import json
-import re
 from openai import OpenAI
 
 app = FastAPI(title="SafeAnswer Grounded QA API")
@@ -31,7 +30,7 @@ class Response(BaseModel):
     confidence: float
     answerable: bool
 
-# Load API key
+# API Key & Client with timeout
 LLM_API_KEY = os.getenv("LLM_API_KEY")
 if not LLM_API_KEY:
     raise RuntimeError("LLM_API_KEY environment variable is not set!")
@@ -39,28 +38,18 @@ if not LLM_API_KEY:
 client = OpenAI(
     base_url="https://api.groq.com/openai/v1",
     api_key=LLM_API_KEY,
-    timeout=4.0   # Strict timeout to prevent hanging
+    timeout=5.0
 )
 
 SYSTEM_PROMPT = """
-You are a strict Grounded QA. Use ONLY the context. 
-If not found: {"answer":"I don't know","citations":[],"confidence":0.2,"answerable":false}
-Else give short answer + citations.
-Output ONLY JSON.
+You are a strict Grounded QA system.
+- Answer ONLY using the provided context chunks.
+- You MUST cite the exact chunk_id(s) used.
+- If the answer is not in the chunks, reply with: 
+  {"answer": "I don't know", "citations": [], "confidence": 0.2, "answerable": false}
+- Keep answer short and factual.
+- Output ONLY valid JSON, no extra text.
 """
-
-# Simple fast fallback using string matching
-def simple_grounded_answer(question: str, chunks: List[Chunk]):
-    q = question.lower()
-    for chunk in chunks:
-        if any(word in chunk.text.lower() for word in q.split() if len(word) > 3):
-            return Response(
-                answer=chunk.text,
-                citations=[chunk.chunk_id],
-                confidence=0.75,
-                answerable=True
-            )
-    return None
 
 @app.post("/grounded-qa", response_model=Response)
 @app.post("/", response_model=Response)
@@ -68,14 +57,17 @@ async def grounded_qa(req: Request):
     if not req.chunks or not req.question or not req.question.strip():
         return Response(answer="I don't know", citations=[], confidence=0.1, answerable=False)
 
-    # Fast simple match first (helps beat timeout)
-    fast_answer = simple_grounded_answer(req.question, req.chunks)
-    if fast_answer:
-        return fast_answer
+    # Create context with IDs
+    context = "\n\n".join([f"Chunk {c.chunk_id}: {c.text}" for c in req.chunks])
 
-    # LLM only if needed
-    context = "\n\n".join([f"[{c.chunk_id}] {c.text}" for c in req.chunks])
-    user_prompt = f"Context:\n{context}\n\nQuestion: {req.question}\nAnswer:"
+    user_prompt = f"""
+Context:
+{context}
+
+Question: {req.question}
+
+Provide a grounded answer.
+"""
 
     try:
         completion = client.chat.completions.create(
@@ -85,35 +77,51 @@ async def grounded_qa(req: Request):
                 {"role": "user", "content": user_prompt}
             ],
             temperature=0.0,
-            max_tokens=100,
+            max_tokens=120,
             response_format={"type": "json_object"}
         )
 
-        data = json.loads(completion.choices[0].message.content)
+        data = json.loads(completion.choices[0].message.content.strip())
 
-        answer = str(data.get("answer", "I don't know")).strip()
-        citations = [str(cid) for cid in data.get("citations", []) 
-                     if str(cid) in {c.chunk_id for c in req.chunks}]
+        answer = str(data.get("answer", "")).strip()
+        raw_citations = data.get("citations", [])
 
-        if "don't know" in answer.lower() or not citations:
-            return Response(answer="I don't know", citations=[], confidence=0.2, answerable=False)
+        # Strict citation validation
+        valid_chunk_ids = {c.chunk_id for c in req.chunks}
+        citations = [cid for cid in raw_citations if str(cid) in valid_chunk_ids]
+
+        answerable = bool(data.get("answerable", False)) and answer and "don't know" not in answer.lower()
+
+        if not answerable or not answer or "I don't know" in answer.lower():
+            return Response(
+                answer="I don't know",
+                citations=[],
+                confidence=0.2,
+                answerable=False
+            )
 
         return Response(
             answer=answer,
-            citations=citations,
-            confidence=0.85,
+            citations=citations[:5],
+            confidence=round(float(data.get("confidence", 0.75)), 2),
             answerable=True
         )
 
     except Exception:
-        return Response(answer="I don't know", citations=[], confidence=0.1, answerable=False)
+        # Safe fallback
+        return Response(
+            answer="I don't know",
+            citations=[],
+            confidence=0.1,
+            answerable=False
+        )
 
 
-# GET compatibility
+# GET support
 @app.get("/grounded-qa")
 @app.get("/")
 async def grounded_qa_get():
-    return {"status": "ok", "message": "Use POST method with JSON body."}
+    return {"status": "ok", "message": "This endpoint requires POST method with JSON body. See /docs"}
 
 
 @app.get("/health")

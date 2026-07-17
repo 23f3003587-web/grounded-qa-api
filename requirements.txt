@@ -1,5 +1,5 @@
 fastapi
 uvicorn
 pydantic
-openai
-python-dotenv
+networkx
+python-multipart

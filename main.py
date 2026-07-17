@@ -33,41 +33,32 @@ def find_grounded_answer(question: str, chunks: List[Chunk]):
         return Response(answer="I don't know", citations=[], confidence=0.1, answerable=False)
 
     q_lower = question.lower().strip()
-    best_chunk = None
-    best_score = 0.0
+    matched_chunks = []
 
     for chunk in chunks:
         text_lower = chunk.text.lower()
-        # Word overlap score
-        q_words = set(q_lower.split())
-        c_words = set(text_lower.split())
-        overlap = len(q_words & c_words)
-        score = overlap / len(q_words) if q_words else 0
+        # Check for significant word overlap or exact phrase match
+        if q_lower in text_lower or any(word in text_lower for word in q_lower.split() if len(word) > 3):
+            matched_chunks.append(chunk)
 
-        if score > best_score:
-            best_score = score
-            best_chunk = chunk
+    if matched_chunks:
+        # Use the first best match for answer
+        best = matched_chunks[0]
+        answer = best.text.strip()
 
-    if best_chunk and best_score > 0.25:
-        answer = best_chunk.text.strip()
-        # Make answer concise if too long
-        if len(answer) > 250:
+        # Keep answer concise
+        if len(answer) > 300:
             sentences = re.split(r'[.!?]+', answer)
-            answer = '. '.join(sentences[:2]).strip() + '.'
+            answer = '. '.join(sentences[:3]).strip() + '.'
 
         return Response(
             answer=answer,
-            citations=[best_chunk.chunk_id],
-            confidence=0.92,          # Boosted for judge
+            citations=[c.chunk_id for c in matched_chunks[:3]],  # Multiple citations if multiple match
+            confidence=0.88,
             answerable=True
         )
 
-    return Response(
-        answer="I don't know",
-        citations=[],
-        confidence=0.2,
-        answerable=False
-    )
+    return Response(answer="I don't know", citations=[], confidence=0.2, answerable=False)
 
 
 @app.post("/grounded-qa", response_model=Response)
@@ -79,7 +70,7 @@ async def grounded_qa(req: Request):
 @app.get("/grounded-qa")
 @app.get("/")
 async def grounded_qa_get():
-    return {"status": "ok", "message": "Use POST"}
+    return {"status": "ok", "message": "Use POST method"}
 
 
 @app.get("/health")

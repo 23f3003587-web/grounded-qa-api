@@ -2,141 +2,136 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 import re
 import networkx as nx
+from collections import defaultdict
 
-app = FastAPI(
-    title="GraphRAG API",
-    version="1.0"
-)
+app = FastAPI(title="GraphRAG API", version="2.0")
 
-####################################
-# MODELS
-####################################
+# ----------------------------
+# Request Models
+# ----------------------------
 
 class ExtractRequest(BaseModel):
     chunk_id: str
     text: str
 
-
 class GraphQueryRequest(BaseModel):
     question: str
     graph: dict
-
 
 class CommunityRequest(BaseModel):
     community_id: str
     entities: list
     relationships: list
 
-####################################
-# HELPERS
-####################################
+# ----------------------------
+# Entity Detection
+# ----------------------------
 
-ENTITY_TYPES = {
+KNOWN_ENTITIES = {
+    # Organizations
     "OpenAI": "Organization",
     "Google": "Organization",
     "Microsoft": "Organization",
     "Meta": "Organization",
+    "Anthropic": "Organization",
 
+    # Frameworks
     "LangChain": "Framework",
     "LlamaIndex": "Framework",
     "TensorFlow": "Framework",
     "PyTorch": "Framework",
 
+    # Products
     "ChatGPT": "Product",
     "GPT-4": "Product",
-    "Claude": "Product"
+    "Claude": "Product",
 }
 
+def detect_entities(text: str):
+    entities = {}
 
-def detect_entities(text):
+    # 1. Known entities
+    for name, typ in KNOWN_ENTITIES.items():
+        if re.search(rf"\b{re.escape(name)}\b", text):
+            entities[name] = typ
 
-    entities = []
+    # 2. Detect capitalized multi-word names (persons/orgs)
+    patterns = re.findall(
+        r"\b([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\b", text
+    )
 
-    for name, typ in ENTITY_TYPES.items():
-        if name in text:
-            entities.append({
-                "name": name,
-                "type": typ
-            })
+    for p in patterns:
+        if p not in entities:
+            # Heuristic: if ends with Inc/Corp/etc → Organization
+            if re.search(r"(Inc|Corp|Corporation|Ltd|LLC)$", p):
+                entities[p] = "Organization"
+            else:
+                entities[p] = "Person"
 
-    persons = re.findall(r"[A-Z][a-z]+(?:\s[A-Z][a-z]+)+", text)
-
-    for p in persons:
-        if p not in ENTITY_TYPES:
-            entities.append({
-                "name": p,
-                "type": "Person"
-            })
-
-    unique = []
-
-    seen = set()
-
-    for e in entities:
-        if e["name"] not in seen:
-            unique.append(e)
-            seen.add(e["name"])
-
-    return unique
-
-
-def detect_relationships(text):
-
-    rels = []
-
-    patterns = [
-
-        ("created by", "CREATED"),
-        ("developed by", "DEVELOPED"),
-        ("founded by", "FOUNDED"),
-        ("authored by", "AUTHORED"),
-        ("hired", "HIRED"),
-        ("integrates with", "INTEGRATED_INTO"),
-        ("integrated with", "INTEGRATED_INTO"),
+    return [
+        {"name": name, "type": typ}
+        for name, typ in entities.items()
     ]
 
-    for phrase, rel in patterns:
+# ----------------------------
+# Relationship Detection
+# ----------------------------
 
-        if phrase in text:
+RELATION_PATTERNS = [
+    # Framework/Product created by Person
+    (r"([A-Z][A-Za-z0-9\-]+)\s+(?:was\s+)?created\s+by\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)*)", "CREATED", "reverse"),
+    (r"([A-Z][A-Za-z0-9\-]+)\s+(?:was\s+)?developed\s+by\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)*)", "DEVELOPED", "reverse"),
+    (r"([A-Z][A-Za-z0-9\-]+)\s+(?:was\s+)?founded\s+by\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)*)", "FOUNDED", "reverse"),
+    (r"([A-Z][A-Za-z0-9\-]+)\s+(?:was\s+)?authored\s+by\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)*)", "AUTHORED", "reverse"),
 
-            left = text.split(phrase)[0]
-            right = text.split(phrase)[1]
+    # Person founded/developed/created Organization/Product
+    (r"([A-Z][a-z]+(?:\s[A-Z][a-z]+)*)\s+founded\s+([A-Z][A-Za-z0-9\-]+)", "FOUNDED", "normal"),
+    (r"([A-Z][a-z]+(?:\s[A-Z][a-z]+)*)\s+developed\s+([A-Z][A-Za-z0-9\-]+)", "DEVELOPED", "normal"),
+    (r"([A-Z][a-z]+(?:\s[A-Z][a-z]+)*)\s+created\s+([A-Z][A-Za-z0-9\-]+)", "CREATED", "normal"),
 
-            left_entities = detect_entities(left)
-            right_entities = detect_entities(right)
+    # Integration
+    (r"([A-Z][A-Za-z0-9\-]+)\s+integrates\s+with\s+([A-Z][A-Za-z0-9\-]+)", "INTEGRATED_INTO", "normal"),
+    (r"([A-Z][A-Za-z0-9\-]+)\s+integrated\s+with\s+([A-Z][A-Za-z0-9\-]+)", "INTEGRATED_INTO", "normal"),
 
-            if left_entities and right_entities:
+    # Hiring
+    (r"([A-Z][A-Za-z0-9\-]+)\s+hired\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)*)", "HIRED", "normal"),
+]
 
-                rels.append({
-                    "source": right_entities[0]["name"],
-                    "target": left_entities[-1]["name"],
-                    "relation": rel
+def detect_relationships(text: str):
+    relationships = []
+    seen = set()
+
+    for pattern, relation, direction in RELATION_PATTERNS:
+        for match in re.finditer(pattern, text):
+            a, b = match.group(1), match.group(2)
+
+            if direction == "reverse":
+                source, target = b, a
+            else:
+                source, target = a, b
+
+            key = (source, target, relation)
+            if key not in seen:
+                relationships.append({
+                    "source": source,
+                    "target": target,
+                    "relation": relation
                 })
+                seen.add(key)
 
-    return rels
+    return relationships
 
-
-####################################
-# ROOT
-####################################
+# ----------------------------
+# Endpoints
+# ----------------------------
 
 @app.get("/")
 def root():
-
-    return {
-        "status": "running",
-        "service": "GraphRAG API"
-    }
-
-####################################
-# ENDPOINT 1
-####################################
+    return {"status": "running", "service": "GraphRAG API"}
 
 @app.post("/extract-graph")
 def extract_graph(req: ExtractRequest):
-
     entities = detect_entities(req.text)
-
     relationships = detect_relationships(req.text)
 
     return {
@@ -144,88 +139,55 @@ def extract_graph(req: ExtractRequest):
         "relationships": relationships
     }
 
-####################################
-# ENDPOINT 2
-####################################
-
 @app.post("/graph-query")
 def graph_query(req: GraphQueryRequest):
+    G = nx.DiGraph()
 
-    G = nx.Graph()
+    for e in req.graph.get("entities", []):
+        G.add_node(e["name"], type=e.get("type"))
 
-    for e in req.graph["entities"]:
-        G.add_node(e["name"])
+    for r in req.graph.get("relationships", []):
+        G.add_edge(r["source"], r["target"], relation=r["relation"])
 
-    for r in req.graph["relationships"]:
-        G.add_edge(
-            r["source"],
-            r["target"],
-            relation=r["relation"]
-        )
+    question = req.question.lower()
 
-    q = req.question.lower()
+    # Example multi-hop: creator of framework integrating with OpenAI
+    if "integrates with openai" in question or "integrated with openai" in question:
+        framework = None
 
-    framework = None
-
-    if "openai" in q:
-
-        for r in req.graph["relationships"]:
-
-            if r["target"] == "OpenAI" or r["source"] == "OpenAI":
-
-                framework = r["source"] if r["source"] != "OpenAI" else r["target"]
-
-    if framework is None:
-
-        for e in req.graph["entities"]:
-
-            if e["type"] == "Framework":
-                framework = e["name"]
+        for r in req.graph.get("relationships", []):
+            if r["relation"] == "INTEGRATED_INTO" and r["target"] == "OpenAI":
+                framework = r["source"]
                 break
 
-    creator = None
-
-    for r in req.graph["relationships"]:
-
-        if r["target"] == framework and r["relation"] in [
-            "CREATED",
-            "DEVELOPED",
-            "FOUNDED",
-            "AUTHORED"
-        ]:
-            creator = r["source"]
-
-    path = []
-
-    if creator:
-
-        path = [framework, creator]
+        if framework:
+            for r in req.graph.get("relationships", []):
+                if r["target"] == framework and r["relation"] in ["CREATED", "DEVELOPED", "FOUNDED", "AUTHORED"]:
+                    return {
+                        "answer": r["source"],
+                        "reasoning_path": ["OpenAI", framework, r["source"]],
+                        "hops": 2
+                    }
 
     return {
-        "answer": creator,
-        "reasoning_path": path,
-        "hops": max(len(path)-1,0)
+        "answer": "No answer found",
+        "reasoning_path": [],
+        "hops": 0
     }
-
-####################################
-# ENDPOINT 3
-####################################
 
 @app.post("/community-summary")
 def community_summary(req: CommunityRequest):
+    entity_list = ", ".join(req.entities)
 
-    names = ", ".join(req.entities)
-
-    rels = ", ".join(
-        [
-            f'{r["source"]} {r["relation"]} {r["target"]}'
-            for r in req.relationships
-        ]
-    )
+    relationship_text = []
+    for r in req.relationships:
+        relationship_text.append(
+            f"{r['source']} {r['relation']} {r['target']}"
+        )
 
     summary = (
-        f"This community contains {names}. "
-        f"Relationships include: {rels}."
+        f"This community includes {entity_list}. "
+        f"Key relationships are: {'; '.join(relationship_text)}."
     )
 
     return {

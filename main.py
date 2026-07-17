@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List
@@ -8,7 +8,7 @@ from openai import OpenAI
 
 app = FastAPI(title="SafeAnswer Grounded QA API")
 
-# CORS for testing
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -31,33 +31,51 @@ class Response(BaseModel):
     confidence: float
     answerable: bool
 
-# Load API key from environment variable ONLY
+# Load API key from environment only
 LLM_API_KEY = os.getenv("LLM_API_KEY")
 if not LLM_API_KEY:
     raise RuntimeError("LLM_API_KEY environment variable is not set!")
 
 client = OpenAI(
-    base_url="https://api.groq.com/openai/v1",   # Change if using OpenAI / Gemini etc.
+    base_url="https://api.groq.com/openai/v1",
     api_key=LLM_API_KEY
 )
 
 SYSTEM_PROMPT = """
-You are a high-reliability Grounded QA system...
-[Same as before]
+You are a high-reliability Grounded QA system for medical and legal compliance.
+Answer the question strictly using only the provided context chunks.
+- If the answer cannot be found in the chunks, return answerable=false, answer="I don't know", citations=[]
+- Always cite the exact chunk_ids used.
+- Be concise and factual.
+- Output ONLY valid JSON with keys: answer, citations (list of strings), confidence (0.0-1.0), answerable (boolean)
 """
 
+# Main endpoint - POST (primary)
 @app.post("/grounded-qa", response_model=Response)
+@app.post("/", response_model=Response)
 async def grounded_qa(req: Request):
     if not req.chunks or not req.question or not req.question.strip():
-        return Response(answer="I don't know", citations=[], confidence=0.1, answerable=False)
+        return Response(
+            answer="I don't know",
+            citations=[],
+            confidence=0.1,
+            answerable=False
+        )
 
     context = "\n\n".join([f"[{c.chunk_id}] {c.text}" for c in req.chunks])
 
-    user_prompt = f"Question: {req.question}\n\nContext:\n{context}\n\nAnswer strictly from context only."
+    user_prompt = f"""
+Question: {req.question}
+
+Context chunks:
+{context}
+
+Answer strictly from the context only.
+"""
 
     try:
         completion = client.chat.completions.create(
-            model="llama-3.1-8b-instant",   # fast & good
+            model="llama-3.1-8b-instant",
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt}
@@ -92,7 +110,23 @@ async def grounded_qa(req: Request):
         )
 
     except Exception:
-        return Response(answer="I don't know", citations=[], confidence=0.1, answerable=False)
+        return Response(
+            answer="I don't know",
+            citations=[],
+            confidence=0.1,
+            answerable=False
+        )
+
+
+# GET support for judge / testing
+@app.get("/grounded-qa")
+@app.get("/")
+async def grounded_qa_get():
+    return {
+        "status": "ok",
+        "message": "This endpoint accepts POST requests only. Use POST method with JSON body.",
+        "docs_url": "/docs"
+    }
 
 
 @app.get("/health")

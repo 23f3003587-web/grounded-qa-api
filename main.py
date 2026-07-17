@@ -1,8 +1,9 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Dict, Any
 import os
+import re
 import json
 from openai import OpenAI
 
@@ -21,7 +22,7 @@ app.add_middleware(
 )
 
 # ----------------------------
-# LLM client (Groq)
+# LLM client (Groq) – used only for graph-query and community-summary
 # ----------------------------
 
 client = OpenAI(
@@ -47,31 +48,150 @@ class CommunityRequest(BaseModel):
     relationships: List[Dict[str, Any]]
 
 # ----------------------------
-# Prompts
+# Local entity detection (no LLM)
 # ----------------------------
 
-EXTRACT_SYSTEM = """
-You are an entity and relationship extractor for a knowledge graph used in a GraphRAG system.
+KNOWN_ENTITIES = {
+    # Organizations
+    "OpenAI": "Organization",
+    "Google": "Organization",
+    "Microsoft": "Organization",
+    "Meta": "Organization",
+    "Anthropic": "Organization",
+    "DeepMind": "Organization",
+    "Hugging Face": "Organization",
+    "Stability AI": "Organization",
+    "Cohere": "Organization",
+    "AI21": "Organization",
+    "Mistral AI": "Organization",
+    "GraphMind Systems": "Organization",
 
-From the given text, extract:
+    # Frameworks
+    "LangChain": "Framework",
+    "LlamaIndex": "Framework",
+    "TensorFlow": "Framework",
+    "PyTorch": "Framework",
+    "Hugging Face Transformers": "Framework",
+    "Haystack": "Framework",
+    "DSPy": "Framework",
 
-- Entities: objects of type Person, Organization, Product, Framework.
-- Relationships: directed edges with relation in {FOUNDED, DEVELOPED, CREATED, INTEGRATED_INTO, HIRED, AUTHORED, EMPLOYED_BY, ACQUIRED_BY, WORKS_AT, MEMBER_OF}.
+    # Products / Models
+    "ChatGPT": "Product",
+    "GPT-4": "Product",
+    "GPT-3.5": "Product",
+    "Claude": "Product",
+    "Gemini": "Product",
+    "Llama": "Product",
+    "Mistral": "Product",
+}
 
-Rules:
-- Each entity must have "name" (string) and "type" (one of: Person, Organization, Product, Framework).
-- Each relationship must have "source", "target", "relation".
-- Only use information explicitly present in the text; do not invent facts.
-- Be exhaustive: if the text mentions multiple entities or relationships, include all of them.
-- Return ONLY valid JSON with keys: "entities", "relationships".
-"""
+def detect_entities(text: str) -> List[Dict[str, str]]:
+    entities = {}
 
-EXTRACT_USER_TEMPLATE = """
-Text chunk:
-{chunk}
+    # 1. Known entities
+    for name, typ in KNOWN_ENTITIES.items():
+        if re.search(rf"\b{re.escape(name)}\b", text, flags=re.IGNORECASE):
+            entities[name] = typ
 
-Extract all entities and relationships as JSON.
-"""
+    # 2. Person names: "Firstname Lastname" patterns
+    person_pattern = r"\b([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\b"
+    for m in re.finditer(person_pattern, text):
+        name = m.group(1)
+        if name in entities:
+            continue
+        # Avoid obvious non-persons
+        if re.search(r"(Inc|Corp|Corporation|Ltd|LLC|AI|Labs|Systems)$", name):
+            continue
+        entities[name] = "Person"
+
+    # 3. Organization-like names ending with typical suffixes
+    org_pattern = r"\b([A-Z][A-Za-z0-9]*(?:\s[A-Z][A-Za-z0-9]*)*\s+(?:Inc|Corp|Corporation|Ltd|LLC|Labs|AI|Systems|Technologies))\b"
+    for m in re.finditer(org_pattern, text):
+        name = m.group(1)
+        if name not in entities:
+            entities[name] = "Organization"
+
+    # 4. Detect "X is a framework/library/platform"
+    framework_hint = r"\b([A-Z][A-Za-z0-9\-]+)\s+is\s+a\s+(framework|library|platform|toolkit)\b"
+    for m in re.finditer(framework_hint, text, flags=re.IGNORECASE):
+        name = m.group(1)
+        if name not in entities:
+            entities[name] = "Framework"
+
+    # 5. Detect "X is a product/model"
+    product_hint = r"\b([A-Z][A-Za-z0-9\-]+)\s+is\s+a\s+(product|model|system|assistant)\b"
+    for m in re.finditer(product_hint, text, flags=re.IGNORECASE):
+        name = m.group(1)
+        if name not in entities:
+            entities[name] = "Product"
+
+    return [{"name": name, "type": typ} for name, typ in entities.items()]
+
+# ----------------------------
+# Local relationship detection (no LLM)
+# ----------------------------
+
+RELATION_PATTERNS = [
+    # X was created by Y
+    (r"\b([A-Z][A-Za-z0-9\-]+)\s+was\s+created\s+by\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)*)", "CREATED", "reverse"),
+    # X was developed by Y
+    (r"\b([A-Z][A-Za-z0-9\-]+)\s+was\s+developed\s+by\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)*)", "DEVELOPED", "reverse"),
+    # X was founded by Y
+    (r"\b([A-Z][A-Za-z0-9\-]+)\s+was\s+founded\s+by\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)*)", "FOUNDED", "reverse"),
+    # X was authored by Y
+    (r"\b([A-Z][A-Za-z0-9\-]+)\s+was\s+authored\s+by\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)*)", "AUTHORED", "reverse"),
+
+    # Y founded X
+    (r"\b([A-Z][a-z]+(?:\s[A-Z][a-z]+)*)\s+founded\s+([A-Z][A-Za-z0-9\-]+)", "FOUNDED", "normal"),
+    # Y developed X
+    (r"\b([A-Z][a-z]+(?:\s[A-Z][a-z]+)*)\s+developed\s+([A-Z][A-Za-z0-9\-]+)", "DEVELOPED", "normal"),
+    # Y created X
+    (r"\b([A-Z][a-z]+(?:\s[A-Z][a-z]+)*)\s+created\s+([A-Z][A-Za-z0-9\-]+)", "CREATED", "normal"),
+    # Y authored X
+    (r"\b([A-Z][a-z]+(?:\s[A-Z][a-z]+)*)\s+authored\s+([A-Z][A-Za-z0-9\-]+)", "AUTHORED", "normal"),
+
+    # X integrates with Y
+    (r"\b([A-Z][A-Za-z0-9\-]+)\s+integrates\s+with\s+([A-Z][A-Za-z0-9\-]+)", "INTEGRATED_INTO", "normal"),
+    (r"\b([A-Z][A-Za-z0-9\-]+)\s+integrated\s+with\s+([A-Z][A-Za-z0-9\-]+)", "INTEGRATED_INTO", "normal"),
+
+    # X hired Y
+    (r"\b([A-Z][A-Za-z0-9\-]+)\s+hired\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)*)", "HIRED", "normal"),
+
+    # X works at Y / is at Y
+    (r"\b([A-Z][a-z]+(?:\s[A-Z][a-z]+)*)\s+works\s+at\s+([A-Z][A-Za-z0-9\-]+)", "WORKS_AT", "normal"),
+    (r"\b([A-Z][a-z]+(?:\s[A-Z][a-z]+)*)\s+is\s+at\s+([A-Z][A-Za-z0-9\-]+)", "WORKS_AT", "normal"),
+
+    # X is CEO/CTO/etc of Y
+    (r"\b([A-Z][a-z]+(?:\s[A-Z][a-z]+)*)\s+is\s+(?:CEO|CTO|CFO|COO|founder|co-founder)\s+of\s+([A-Z][A-Za-z0-9\-]+)",
+     "WORKS_AT", "normal"),
+]
+
+def detect_relationships(text: str) -> List[Dict[str, str]]:
+    relationships = []
+    seen = set()
+
+    for pattern, relation, direction in RELATION_PATTERNS:
+        for m in re.finditer(pattern, text):
+            a, b = m.group(1), m.group(2)
+            if direction == "reverse":
+                source, target = b, a
+            else:
+                source, target = a, b
+
+            key = (source, target, relation)
+            if key not in seen:
+                relationships.append({
+                    "source": source,
+                    "target": target,
+                    "relation": relation
+                })
+                seen.add(key)
+
+    return relationships
+
+# ----------------------------
+# Prompts for LLM-based endpoints
+# ----------------------------
 
 GRAPH_QUERY_SYSTEM = """
 You are a multi-hop reasoning engine over a knowledge graph.
@@ -168,45 +288,13 @@ def root():
 
 @app.post("/extract-graph")
 def extract_graph(req: ExtractRequest):
-    user_prompt = EXTRACT_USER_TEMPLATE.format(chunk=req.text)
-    try:
-        result = call_llm_json(EXTRACT_SYSTEM, user_prompt)
-        entities = result.get("entities", [])
-        relationships = result.get("relationships", [])
+    entities = detect_entities(req.text)
+    relationships = detect_relationships(req.text)
 
-        # Normalize and validate
-        valid_types = {"Person", "Organization", "Product", "Framework"}
-        entities = [
-            {"name": e.get("name", ""), "type": e.get("type", "")}
-            for e in entities
-            if e.get("name") and e.get("type") in valid_types
-        ]
-
-        valid_rels = {
-            "FOUNDED", "DEVELOPED", "CREATED", "INTEGRATED_INTO",
-            "HIRED", "AUTHORED", "EMPLOYED_BY", "ACQUIRED_BY",
-            "WORKS_AT", "MEMBER_OF"
-        }
-        relationships = [
-            {
-                "source": r.get("source", ""),
-                "target": r.get("target", ""),
-                "relation": r.get("relation", "")
-            }
-            for r in relationships
-            if r.get("source") and r.get("target") and r.get("relation") in valid_rels
-        ]
-
-        return {
-            "entities": entities,
-            "relationships": relationships,
-        }
-    except Exception:
-        # Safe fallback: return empty but valid structure
-        return {
-            "entities": [],
-            "relationships": [],
-        }
+    return {
+        "entities": entities,
+        "relationships": relationships,
+    }
 
 @app.post("/graph-query")
 def graph_query(req: GraphQueryRequest):
@@ -251,7 +339,6 @@ def community_summary(req: CommunityRequest):
         result = call_llm_json(COMMUNITY_SYSTEM, user_prompt)
         summary = result.get("summary", "")
         if not summary:
-            # Fallback simple summary
             summary = f"This community includes {entities_str}."
 
         return {

@@ -29,41 +29,43 @@ class Response(BaseModel):
     answerable: bool
 
 def tokenize(text: str):
-    return set(re.findall(r"[a-z0-9]+", text.lower()))
+    # Better tokenization
+    return set(re.findall(r'\b[a-z0-9]+\b', text.lower()))
 
 def find_grounded_answer(question: str, chunks: List[Chunk]):
     if not chunks or not question or not question.strip():
         return Response(answer="I don't know", citations=[], confidence=0.1, answerable=False)
 
-    q_lower = question.strip()
-    q_tokens = tokenize(q_lower)
+    q_tokens = tokenize(question)
     best_sentence = None
     best_chunk = None
     best_score = 0
 
     for chunk in chunks:
         # Split chunk into sentences
-        sentences = re.split(r'(?<=[.!?])\s+', chunk.text.strip())
+        sentences = re.split(r'(?<=[.!?])\s+', chunk.text)
         for sent in sentences:
-            if not sent.strip():
+            sent = sent.strip()
+            if not sent:
                 continue
             sent_tokens = tokenize(sent)
+            # Overlap score
             score = len(q_tokens & sent_tokens)
             if score > best_score:
                 best_score = score
-                best_sentence = sent.strip()
+                best_sentence = sent
                 best_chunk = chunk
 
     if best_sentence and best_score > 0 and best_chunk:
-        # Clean answer
         answer = best_sentence
+        # Keep answer reasonable
         if len(answer) > 280:
-            answer = answer[:280].rsplit(' ', 1)[0] + '...'
+            answer = answer[:277] + "..."
 
         return Response(
             answer=answer,
             citations=[best_chunk.chunk_id],
-            confidence=0.92,
+            confidence=0.93,
             answerable=True
         )
 
@@ -84,7 +86,7 @@ async def grounded_qa(req: Request):
 @app.get("/grounded-qa")
 @app.get("/")
 async def grounded_qa_get():
-    return {"status": "ok", "message": "Use POST method"}
+    return {"status": "ok", "message": "Use POST"}
 
 
 @app.get("/health")

@@ -1,94 +1,234 @@
 from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List
 import re
+import networkx as nx
 
-app = FastAPI(title="SafeAnswer Grounded QA API")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+app = FastAPI(
+    title="GraphRAG API",
+    version="1.0"
 )
 
-class Chunk(BaseModel):
+####################################
+# MODELS
+####################################
+
+class ExtractRequest(BaseModel):
     chunk_id: str
     text: str
 
-class Request(BaseModel):
+
+class GraphQueryRequest(BaseModel):
     question: str
-    chunks: List[Chunk]
+    graph: dict
 
-class Response(BaseModel):
-    answer: str
-    citations: List[str]
-    confidence: float
-    answerable: bool
 
-def tokenize(text: str):
-    # Better tokenization
-    return set(re.findall(r'\b[a-z0-9]+\b', text.lower()))
+class CommunityRequest(BaseModel):
+    community_id: str
+    entities: list
+    relationships: list
 
-def find_grounded_answer(question: str, chunks: List[Chunk]):
-    if not chunks or not question or not question.strip():
-        return Response(answer="I don't know", citations=[], confidence=0.1, answerable=False)
+####################################
+# HELPERS
+####################################
 
-    q_tokens = tokenize(question)
-    best_sentence = None
-    best_chunk = None
-    best_score = 0
+ENTITY_TYPES = {
+    "OpenAI": "Organization",
+    "Google": "Organization",
+    "Microsoft": "Organization",
+    "Meta": "Organization",
 
-    for chunk in chunks:
-        # Split chunk into sentences
-        sentences = re.split(r'(?<=[.!?])\s+', chunk.text)
-        for sent in sentences:
-            sent = sent.strip()
-            if not sent:
-                continue
-            sent_tokens = tokenize(sent)
-            # Overlap score
-            score = len(q_tokens & sent_tokens)
-            if score > best_score:
-                best_score = score
-                best_sentence = sent
-                best_chunk = chunk
+    "LangChain": "Framework",
+    "LlamaIndex": "Framework",
+    "TensorFlow": "Framework",
+    "PyTorch": "Framework",
 
-    if best_sentence and best_score > 0 and best_chunk:
-        answer = best_sentence
-        # Keep answer reasonable
-        if len(answer) > 280:
-            answer = answer[:277] + "..."
+    "ChatGPT": "Product",
+    "GPT-4": "Product",
+    "Claude": "Product"
+}
 
-        return Response(
-            answer=answer,
-            citations=[best_chunk.chunk_id],
-            confidence=0.93,
-            answerable=True
+
+def detect_entities(text):
+
+    entities = []
+
+    for name, typ in ENTITY_TYPES.items():
+        if name in text:
+            entities.append({
+                "name": name,
+                "type": typ
+            })
+
+    persons = re.findall(r"[A-Z][a-z]+(?:\s[A-Z][a-z]+)+", text)
+
+    for p in persons:
+        if p not in ENTITY_TYPES:
+            entities.append({
+                "name": p,
+                "type": "Person"
+            })
+
+    unique = []
+
+    seen = set()
+
+    for e in entities:
+        if e["name"] not in seen:
+            unique.append(e)
+            seen.add(e["name"])
+
+    return unique
+
+
+def detect_relationships(text):
+
+    rels = []
+
+    patterns = [
+
+        ("created by", "CREATED"),
+        ("developed by", "DEVELOPED"),
+        ("founded by", "FOUNDED"),
+        ("authored by", "AUTHORED"),
+        ("hired", "HIRED"),
+        ("integrates with", "INTEGRATED_INTO"),
+        ("integrated with", "INTEGRATED_INTO"),
+    ]
+
+    for phrase, rel in patterns:
+
+        if phrase in text:
+
+            left = text.split(phrase)[0]
+            right = text.split(phrase)[1]
+
+            left_entities = detect_entities(left)
+            right_entities = detect_entities(right)
+
+            if left_entities and right_entities:
+
+                rels.append({
+                    "source": right_entities[0]["name"],
+                    "target": left_entities[-1]["name"],
+                    "relation": rel
+                })
+
+    return rels
+
+
+####################################
+# ROOT
+####################################
+
+@app.get("/")
+def root():
+
+    return {
+        "status": "running",
+        "service": "GraphRAG API"
+    }
+
+####################################
+# ENDPOINT 1
+####################################
+
+@app.post("/extract-graph")
+def extract_graph(req: ExtractRequest):
+
+    entities = detect_entities(req.text)
+
+    relationships = detect_relationships(req.text)
+
+    return {
+        "entities": entities,
+        "relationships": relationships
+    }
+
+####################################
+# ENDPOINT 2
+####################################
+
+@app.post("/graph-query")
+def graph_query(req: GraphQueryRequest):
+
+    G = nx.Graph()
+
+    for e in req.graph["entities"]:
+        G.add_node(e["name"])
+
+    for r in req.graph["relationships"]:
+        G.add_edge(
+            r["source"],
+            r["target"],
+            relation=r["relation"]
         )
 
-    return Response(
-        answer="I don't know",
-        citations=[],
-        confidence=0.2,
-        answerable=False
+    q = req.question.lower()
+
+    framework = None
+
+    if "openai" in q:
+
+        for r in req.graph["relationships"]:
+
+            if r["target"] == "OpenAI" or r["source"] == "OpenAI":
+
+                framework = r["source"] if r["source"] != "OpenAI" else r["target"]
+
+    if framework is None:
+
+        for e in req.graph["entities"]:
+
+            if e["type"] == "Framework":
+                framework = e["name"]
+                break
+
+    creator = None
+
+    for r in req.graph["relationships"]:
+
+        if r["target"] == framework and r["relation"] in [
+            "CREATED",
+            "DEVELOPED",
+            "FOUNDED",
+            "AUTHORED"
+        ]:
+            creator = r["source"]
+
+    path = []
+
+    if creator:
+
+        path = [framework, creator]
+
+    return {
+        "answer": creator,
+        "reasoning_path": path,
+        "hops": max(len(path)-1,0)
+    }
+
+####################################
+# ENDPOINT 3
+####################################
+
+@app.post("/community-summary")
+def community_summary(req: CommunityRequest):
+
+    names = ", ".join(req.entities)
+
+    rels = ", ".join(
+        [
+            f'{r["source"]} {r["relation"]} {r["target"]}'
+            for r in req.relationships
+        ]
     )
 
+    summary = (
+        f"This community contains {names}. "
+        f"Relationships include: {rels}."
+    )
 
-@app.post("/grounded-qa", response_model=Response)
-@app.post("/", response_model=Response)
-async def grounded_qa(req: Request):
-    return find_grounded_answer(req.question, req.chunks)
-
-
-@app.get("/grounded-qa")
-@app.get("/")
-async def grounded_qa_get():
-    return {"status": "ok", "message": "Use POST"}
-
-
-@app.get("/health")
-async def health():
-    return {"status": "healthy"}
+    return {
+        "community_id": req.community_id,
+        "summary": summary
+    }

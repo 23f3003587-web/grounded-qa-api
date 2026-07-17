@@ -33,32 +33,47 @@ def find_grounded_answer(question: str, chunks: List[Chunk]):
         return Response(answer="I don't know", citations=[], confidence=0.1, answerable=False)
 
     q_lower = question.lower().strip()
-    matched_chunks = []
+
+    # Find the best matching chunk(s)
+    best_chunk = None
+    highest_score = 0
 
     for chunk in chunks:
-        text_lower = chunk.text.lower()
-        # Check for significant word overlap or exact phrase match
-        if q_lower in text_lower or any(word in text_lower for word in q_lower.split() if len(word) > 3):
-            matched_chunks.append(chunk)
+        c_lower = chunk.text.lower()
+        # Score calculation
+        score = 0
+        if q_lower in c_lower:
+            score = 1.0
+        else:
+            q_words = set(q_lower.split())
+            c_words = set(c_lower.split())
+            common = len(q_words & c_words)
+            score = common / len(q_words) if q_words else 0
 
-    if matched_chunks:
-        # Use the first best match for answer
-        best = matched_chunks[0]
-        answer = best.text.strip()
+        if score > highest_score:
+            highest_score = score
+            best_chunk = chunk
 
-        # Keep answer concise
-        if len(answer) > 300:
-            sentences = re.split(r'[.!?]+', answer)
-            answer = '. '.join(sentences[:3]).strip() + '.'
+    if best_chunk and highest_score > 0.25:
+        answer = best_chunk.text.strip()
+        # Keep answer reasonable length
+        if len(answer) > 280:
+            sentences = re.split(r'(?<=[.!?])\s+', answer)
+            answer = ' '.join(sentences[:2]).strip()
 
         return Response(
             answer=answer,
-            citations=[c.chunk_id for c in matched_chunks[:3]],  # Multiple citations if multiple match
-            confidence=0.88,
+            citations=[best_chunk.chunk_id],   # Strict - only real chunk_id
+            confidence=0.92,
             answerable=True
         )
 
-    return Response(answer="I don't know", citations=[], confidence=0.2, answerable=False)
+    return Response(
+        answer="I don't know",
+        citations=[],
+        confidence=0.2,
+        answerable=False
+    )
 
 
 @app.post("/grounded-qa", response_model=Response)
@@ -70,7 +85,7 @@ async def grounded_qa(req: Request):
 @app.get("/grounded-qa")
 @app.get("/")
 async def grounded_qa_get():
-    return {"status": "ok", "message": "Use POST method"}
+    return {"status": "ok", "message": "POST required"}
 
 
 @app.get("/health")

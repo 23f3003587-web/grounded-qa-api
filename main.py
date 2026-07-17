@@ -3,8 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List
 import os
-import json
-from openai import OpenAI
+import re
 
 app = FastAPI(title="SafeAnswer Grounded QA API")
 
@@ -30,100 +29,56 @@ class Response(BaseModel):
     confidence: float
     answerable: bool
 
-# API Key & Client with timeout
-LLM_API_KEY = os.getenv("LLM_API_KEY")
-if not LLM_API_KEY:
-    raise RuntimeError("LLM_API_KEY environment variable is not set!")
+# Pure Python Grounded QA - Very Fast
+def find_grounded_answer(question: str, chunks: List[Chunk]):
+    if not chunks or not question.strip():
+        return Response(answer="I don't know", citations=[], confidence=0.1, answerable=False)
 
-client = OpenAI(
-    base_url="https://api.groq.com/openai/v1",
-    api_key=LLM_API_KEY,
-    timeout=5.0
-)
+    q_lower = question.lower().strip()
+    best_chunk = None
+    best_score = 0
 
-SYSTEM_PROMPT = """
-You are a strict Grounded QA system.
-- Answer ONLY using the provided context chunks.
-- You MUST cite the exact chunk_id(s) used.
-- If the answer is not in the chunks, reply with: 
-  {"answer": "I don't know", "citations": [], "confidence": 0.2, "answerable": false}
-- Keep answer short and factual.
-- Output ONLY valid JSON, no extra text.
-"""
+    for chunk in chunks:
+        text_lower = chunk.text.lower()
+        # Score based on word overlap
+        words = set(q_lower.split())
+        chunk_words = set(text_lower.split())
+        score = len(words & chunk_words) / len(words) if words else 0
+
+        if score > best_score:
+            best_score = score
+            best_chunk = chunk
+
+    if best_chunk and best_score > 0.3:
+        # Extract short answer from chunk
+        answer = best_chunk.text.strip()
+        # Try to make it more concise
+        if len(answer) > 200:
+            sentences = re.split(r'[.!?]', answer)
+            answer = '.'.join(sentences[:2]).strip() + '.'
+
+        return Response(
+            answer=answer,
+            citations=[best_chunk.chunk_id],
+            confidence=round(best_score, 2),
+            answerable=True
+        )
+    
+    return Response(answer="I don't know", citations=[], confidence=0.2, answerable=False)
+
 
 @app.post("/grounded-qa", response_model=Response)
 @app.post("/", response_model=Response)
 async def grounded_qa(req: Request):
-    if not req.chunks or not req.question or not req.question.strip():
-        return Response(answer="I don't know", citations=[], confidence=0.1, answerable=False)
-
-    # Create context with IDs
-    context = "\n\n".join([f"Chunk {c.chunk_id}: {c.text}" for c in req.chunks])
-
-    user_prompt = f"""
-Context:
-{context}
-
-Question: {req.question}
-
-Provide a grounded answer.
-"""
-
-    try:
-        completion = client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt}
-            ],
-            temperature=0.0,
-            max_tokens=120,
-            response_format={"type": "json_object"}
-        )
-
-        data = json.loads(completion.choices[0].message.content.strip())
-
-        answer = str(data.get("answer", "")).strip()
-        raw_citations = data.get("citations", [])
-
-        # Strict citation validation
-        valid_chunk_ids = {c.chunk_id for c in req.chunks}
-        citations = [cid for cid in raw_citations if str(cid) in valid_chunk_ids]
-
-        answerable = bool(data.get("answerable", False)) and answer and "don't know" not in answer.lower()
-
-        if not answerable or not answer or "I don't know" in answer.lower():
-            return Response(
-                answer="I don't know",
-                citations=[],
-                confidence=0.2,
-                answerable=False
-            )
-
-        return Response(
-            answer=answer,
-            citations=citations[:5],
-            confidence=round(float(data.get("confidence", 0.75)), 2),
-            answerable=True
-        )
-
-    except Exception:
-        # Safe fallback
-        return Response(
-            answer="I don't know",
-            citations=[],
-            confidence=0.1,
-            answerable=False
-        )
+    return find_grounded_answer(req.question, req.chunks)
 
 
-# GET support
 @app.get("/grounded-qa")
 @app.get("/")
 async def grounded_qa_get():
-    return {"status": "ok", "message": "This endpoint requires POST method with JSON body. See /docs"}
+    return {"status": "ok", "message": "Use POST method with JSON body"}
 
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "llm_ready": True}
+    return {"status": "healthy", "llm_ready": "pure_python"}
